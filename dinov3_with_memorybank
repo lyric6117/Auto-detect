@@ -1,0 +1,392 @@
+import os
+import sys
+
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from PIL import Image
+import faiss
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+import warnings
+import datetime  # 导入标准库的datetime模块
+import dinov3.distributed as distributed
+from dinov3.configs import setup_config, DinoV3SetupArgs, setup_job  # 修正配置导入（原拼写错误+正确函数）
+from dinov3.models import build_model_for_eval  # 改用评估模式构建函数
+
+
+warnings.filterwarnings("ignore")
+
+
+# ======== 核心配置（遵循DINOv3官方推荐） ========
+class Config:
+    # 模型配置
+    MODEL_NAME = "dinov3_vitl16_lvd1689m_distilled"
+    PATCH_SIZE = 16  # 与模型匹配（14为默认，vitg14支持28）
+    IMG_SIZE = 576  #
+
+    # 异常检测参数（官方经验值）
+    K_NEIGHBORS = 5  # 近邻数（5-10最佳）
+    PERCENTILE = 95  # 图像级分数计算分位数
+    FEATURE_LAYER = "x_norm_patchtokens"  # 推荐使用归一化后的patch特征
+    NORM_TYPE = "l2"  # 特征归一化方式（官方推荐l2）
+
+    # 性能配置
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    BATCH_SIZE = 8  # 批量特征提取（GPU充足可增大）
+    FAISS_INDEX_TYPE = "FlatL2"  # 官方推荐：小规模用FlatL2，大规模用IVF
+    GPU_INDEX = torch.cuda.is_available()  # FAISS是否使用GPU加速
+
+
+# ======== Step 1: DINOv3模型加载（严格遵循官方用法） ========
+
+def load_dinov3_model(
+        weight_path=r"D:\ly\dinov3-main\dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+        model_name=Config.MODEL_NAME,
+        use_pretrain=True
+):
+    repo_root = r"D:\ly\dinov3-main"
+    sys.path.append(repo_root)
+
+    # 构建配置文件路径（跨平台兼容）
+    config_path = os.path.join(
+        repo_root, "dinov3", "configs", "train", f"{model_name}.yaml"
+    )
+
+    # 检查配置文件是否存在
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"配置文件不存在: {config_path}\n"
+            f"请确认model_name是否为以下之一：\n"
+            f"- dinov3_vitl16_lvd1689m_distilled\n"
+            f"- vitl_im1k_lin834"
+        )
+
+    # 初始化分布式环境（修正Timedelta的使用）
+    output_dir = "./outputs"
+    setup_job(
+        output_dir=output_dir,
+        distributed_enabled=False,
+        seed=42,
+        distributed_timeout=datetime.timedelta(minutes=30)
+    )
+
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 创建配置参数
+    setup_args = DinoV3SetupArgs(
+        config_file=config_path,
+        pretrained_weights=weight_path,
+        output_dir=output_dir,
+        opts=[]
+    )
+
+    # 加载配置
+    cfg = setup_config(setup_args, strict_cfg=False)
+
+    # 构建模型
+    model = build_model_for_eval(
+        config=cfg,
+        pretrained_weights=weight_path
+    )
+
+    # 设置设备和评估模式
+    model.eval().to(Config.DEVICE)
+    for p in model.parameters():
+        p.requires_grad = False
+
+    print(
+        f"✅ 成功加载 DINOv3 模型: {model_name}\n"
+        f"设备: {Config.DEVICE}\n"
+        f"分布式进程数: {distributed.get_world_size()}"
+    )
+    return model
+
+# ======== Step 2: 预处理管道（严格遵循DINOv3官方规范） ========
+def get_dinov3_transform(img_size=Config.IMG_SIZE):
+    """
+    获取DINOv3官方推荐的图像预处理管道
+    参考：https://github.com/facebookresearch/dinov3#preprocessing
+    """
+    return transforms.Compose([
+        transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        # 官方归一化参数（与DINOv2保持一致，但强制使用）
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        ),
+    ])
+
+
+transform = get_dinov3_transform()
+
+
+# ======== Step 3: 特征提取（支持批量处理和分层特征） ========
+def extract_single_feature(img_path, model, transform):
+    """单张图像特征提取（保持兼容性）"""
+    img = Image.open(img_path).convert("RGB")
+    x = transform(img).unsqueeze(0).to(Config.DEVICE)
+    with torch.no_grad():
+        feats_dict = model.forward_features(x)
+        # 获取指定层特征（官方推荐x_norm_patchtokens）
+        feats = feats_dict[Config.FEATURE_LAYER]
+        # 特征归一化（官方强制要求，提升检索效果）
+        if Config.NORM_TYPE == "l2":
+            feats = F.normalize(feats, dim=-1)
+    return feats.squeeze(0).cpu().numpy()
+
+
+def extract_batch_features(img_paths, model, transform, batch_size=Config.BATCH_SIZE):
+    """批量特征提取（官方推荐，提升效率）"""
+    all_feats = []
+    for i in tqdm(range(0, len(img_paths), batch_size), desc="📥 批量提取特征"):
+        batch_paths = img_paths[i:i + batch_size]
+        # 批量加载图像
+        imgs = [Image.open(path).convert("RGB") for path in batch_paths]
+        x = torch.stack([transform(img) for img in imgs]).to(Config.DEVICE)
+        # 批量提取特征
+        with torch.no_grad():
+            feats_dict = model.forward_features(x)
+            feats = feats_dict[Config.FEATURE_LAYER]
+            if Config.NORM_TYPE == "l2":
+                feats = F.normalize(feats, dim=-1)
+        all_feats.append(feats.cpu().numpy())
+    return np.concatenate(all_feats, axis=0)
+
+
+def get_patch_grid_size(img_size=Config.IMG_SIZE, patch_size=Config.PATCH_SIZE):
+    """计算patch网格尺寸（确保整除，官方要求）"""
+    assert img_size % patch_size == 0, f"❌ 图像尺寸{img_size}必须能被patch尺寸{patch_size}整除"
+    return (img_size // patch_size, img_size // patch_size)
+
+
+# ======== Step 4: 优化的Memory Bank（FAISS官方最佳实践） ========
+class MemoryBank:
+    def __init__(self):
+        self.index = None
+        self.feats = None
+        self.dim = None
+        self.grid_h, self.grid_w = get_patch_grid_size()
+
+    def build(self, normal_paths, model, transform):
+        """构建内存银行（支持批量处理和GPU加速）"""
+        print(f"🔨 开始构建Memory Bank（正常样本数：{len(normal_paths)}）")
+
+        # 批量提取正常样本特征
+        self.feats = extract_batch_features(normal_paths, model, transform)
+        print(f"📊 提取特征统计：总数={len(self.feats)}, shape={self.feats.shape}")
+
+        # ✅ flatten patch 特征
+        if self.feats.ndim == 3:
+            n_img, n_patch, dim = self.feats.shape
+            self.feats = self.feats.reshape(n_img * n_patch, dim)
+            self.dim = dim
+        else:
+            self.dim = self.feats.shape[1]
+
+        print(f"✅ Flatten 后特征：{self.feats.shape}")
+
+        # 构建FAISS索引
+        self._build_faiss_index()
+        print(f"✅ Memory Bank构建完成（索引类型：{Config.FAISS_INDEX_TYPE}）")
+
+    def _build_faiss_index(self):
+        """构建FAISS索引（支持GPU加速）"""
+        if Config.FAISS_INDEX_TYPE == "FlatL2":
+            self.index = faiss.IndexFlatL2(self.dim)
+        elif Config.FAISS_INDEX_TYPE == "IVF":
+            # 大规模数据推荐：IVF索引（需要训练）
+            nlist = min(100, len(self.feats) // 10)
+            self.index = faiss.IndexIVFFlat(
+                faiss.IndexFlatL2(self.dim), self.dim, nlist, faiss.METRIC_L2
+            )
+            self.index.train(self.feats.astype(np.float32))
+        else:
+            raise ValueError(f"❌ 不支持的索引类型：{Config.FAISS_INDEX_TYPE}")
+
+        # GPU加速（如果可用）
+        if Config.GPU_INDEX:
+            res = faiss.StandardGpuResources()
+            self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+
+        self.index.add(self.feats.astype(np.float32))
+
+    def search(self, query_feats, k=Config.K_NEIGHBORS):
+        """搜索最近邻（返回距离和索引）"""
+        assert self.index is not None, "❌ Memory Bank未构建"
+        query_feats = query_feats.astype(np.float32)
+        distances, indices = self.index.search(query_feats, k)
+        return distances, indices
+
+
+# ======== Step 5: 异常检测器（结合DINOv3特征特性优化） ========
+class AnomalyDetector:
+    def __init__(self, memory_bank, model, transform):
+        self.memory_bank = memory_bank
+        self.model = model
+        self.transform = transform
+        self.k = Config.K_NEIGHBORS
+        self.percentile = Config.PERCENTILE
+        self.grid_h, self.grid_w = get_patch_grid_size()
+
+    def predict(self, img_path, return_heatmap=True):
+        """预测异常分数（优化patch分数计算）"""
+        # 提取查询特征
+        feats = extract_single_feature(img_path, self.model, self.transform)
+
+        # 搜索最近邻
+        distances, _ = self.memory_bank.search(feats, self.k)
+
+        # 优化：使用中位数+均值组合（官方推荐，鲁棒性更强）
+        patch_scores = (distances.mean(axis=1) + np.median(distances, axis=1)) / 2
+
+        # 图像级分数：使用95分位数（官方经验值）
+        img_score = np.percentile(patch_scores, self.percentile)
+
+        if return_heatmap:
+            heatmap = patch_scores.reshape(self.grid_h, self.grid_w)
+            return img_score, heatmap, patch_scores
+        return img_score
+
+    def visualize(self, img_path, save_path="anomaly_visualization.png"):
+        """可视化优化（官方风格热力图）"""
+        img_score, heatmap, _ = self.predict(img_path)
+
+        # 热力图后处理（官方推荐：平滑+归一化）
+        heatmap_norm = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+        # 双线性插值到原图尺寸（保持细节）
+        heatmap_resized = cv2.resize(
+            heatmap_norm, (Config.IMG_SIZE, Config.IMG_SIZE),
+            interpolation=cv2.INTER_LINEAR
+        )
+        # 高斯平滑（核大小为patch_size的整数倍）
+        smooth_kernel = Config.PATCH_SIZE * 2 + 1
+        heatmap_smooth = cv2.GaussianBlur(heatmap_resized, (smooth_kernel, smooth_kernel), 0)
+
+        # 加载并调整原图
+        img = Image.open(img_path).convert("RGB").resize((Config.IMG_SIZE, Config.IMG_SIZE))
+        img = np.array(img)
+
+        # 官方风格可视化
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+        # 原图
+        axes[0].imshow(img)
+        axes[0].set_title("Original Image", fontsize=14, fontweight="bold")
+        axes[0].axis("off")
+
+        # 热力图
+        im = axes[1].imshow(heatmap_smooth, cmap="jet")
+        axes[1].set_title("Anomaly Heatmap", fontsize=14, fontweight="bold")
+        axes[1].axis("off")
+        # 添加颜色条（官方推荐）
+        cbar = plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        cbar.set_label("Anomaly Score", fontsize=12)
+
+        # 叠加图
+        axes[2].imshow(img)
+        axes[2].imshow(heatmap_smooth, cmap="jet", alpha=0.5)
+        axes[2].set_title(f"Anomaly Detection\nScore: {img_score:.4f}", fontsize=14, fontweight="bold")
+        axes[2].axis("off")
+
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=200, bbox_inches="tight", facecolor="white")
+        print(f"📸 可视化结果已保存至：{save_path}")
+
+
+# ======== Step 6: 工具函数（数据校验+结果分析） ========
+def validate_data_paths(normal_dir, test_dir):
+    """校验数据路径（官方推荐的输入检查）"""
+    normal_dir = Path(normal_dir)
+    test_dir = Path(test_dir)
+
+    # 检查文件夹是否存在
+    assert normal_dir.exists(), f"❌ 正常样本文件夹不存在：{normal_dir}"
+    assert test_dir.exists(), f"❌ 测试样本文件夹不存在：{test_dir}"
+
+    # 获取支持的图像格式（官方推荐：png/jpg/jpeg）
+    img_extensions = (".png", ".jpg", ".jpeg")
+    normal_paths = [p for p in normal_dir.glob("*") if p.suffix.lower() in img_extensions]
+    test_paths = [p for p in test_dir.glob("*") if p.suffix.lower() in img_extensions]
+
+    # 检查样本数量
+    assert len(normal_paths) > 0, f"❌ 正常样本文件夹为空：{normal_dir}"
+    assert len(test_paths) > 0, f"❌ 测试样本文件夹为空：{test_dir}"
+
+    print(f"📁 数据统计：正常样本={len(normal_paths)}, 测试样本={len(test_paths)}")
+    return normal_paths, test_paths
+
+
+def calculate_threshold(results, method="otsu"):
+    """计算异常阈值（官方推荐Otsu自动阈值）"""
+    scores = np.array([s for _, s in results], dtype=np.float32)
+    if method == "otsu":
+        # Otsu阈值法（自动区分正常/异常）
+        scores_norm = (scores - np.min(scores)) / (np.max(scores) - np.min(scores)) * 255
+        scores_norm = scores_norm.astype(np.uint8)
+        # 注意：cv2.threshold 的返回是 (阈值, 二值化图像)
+        otsu_val, _ = cv2.threshold(scores_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # 反归一化回原始分数区间
+        threshold = otsu_val / 255 * (np.max(scores) - np.min(scores)) + np.min(scores)
+    else:
+        # 经验阈值（95分位数）
+        threshold = np.percentile(scores, 95)
+
+    # 防止threshold是数组
+    if isinstance(threshold, np.ndarray):
+        threshold = float(threshold.ravel()[0])
+
+    print(f"📏 计算异常阈值：{threshold:.4f}（方法：{method}）")
+    return threshold
+
+
+
+# ======== Step 7: 完整流程（官方推荐的执行顺序） ========
+if __name__ == "__main__":
+    # 1. 配置数据路径（请根据实际情况修改）
+    normal_dir = r"C:\Users\Administrator\Desktop\f-AnoGAN\RD4AD-main\mvtec\zhawa_guzhang\train\good"
+    test_dir = r"C:\Users\Administrator\Desktop\f-AnoGAN\RD4AD-main\mvtec\zhawa_guzhang\test\zhawa,cuanchu"
+
+    # 2. 数据校验
+    normal_paths, test_paths = validate_data_paths(normal_dir, test_dir)
+
+    # 3. 加载DINOv3模型
+    model = load_dinov3_model(model_name=Config.MODEL_NAME)
+
+    # 4. 构建Memory Bank
+    memory_bank = MemoryBank()
+    memory_bank.build(normal_paths, model, transform)
+
+    # 5. 创建异常检测器
+    detector = AnomalyDetector(memory_bank, model, transform)
+
+    # 6. 批量检测测试样本
+    print("\n🔍 开始批量异常检测...")
+    results = []
+    for test_path in tqdm(test_paths, desc="检测进度"):
+        img_score = detector.predict(test_path, return_heatmap=False)
+        results.append((test_path.name, img_score))
+
+    # 7. 结果分析与排序
+    results.sort(key=lambda x: x[1], reverse=True)
+    threshold = calculate_threshold(results, method="otsu")
+
+    # 8. 输出异常检测结果
+    print("\n🚨 异常检测结果（按异常分数降序）：")
+    for idx, (name, score) in enumerate(results[:10], 1):
+        status = "异常" if score > threshold else "正常"
+        print(f"  Top{idx:2d}: {name:<20} 分数：{score:.4f} 状态：{status}")
+
+    # 9. 可视化Top1异常样本
+    if results:
+        top_anomaly_name = results[0][0]
+        top_anomaly_path = Path(test_dir) / top_anomaly_name
+        print(f"\n📊 可视化Top1异常样本：{top_anomaly_name}")
+        detector.visualize(str(top_anomaly_path), save_path="top_anomaly_visualization.png")
+
+    print("\n🎉 异常检测流程完成！")
