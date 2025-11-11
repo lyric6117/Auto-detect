@@ -1,4 +1,4 @@
-"""核心筛选逻辑（严格遵循DINOv3 demo）"""
+"""核心筛选逻辑（GPU预处理优化版 - 完整版）"""
 
 import os
 import sys
@@ -9,78 +9,167 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
-from sklearn.decomposition import PCA
-from sklearn.neighbors import LocalOutlierFactor, NearestNeighbors
+from sklearn.decomposition import PCA, IncrementalPCA
+from sklearn.neighbors import NearestNeighbors
 from sklearn.ensemble import IsolationForest
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.neighbors import KernelDensity
 import matplotlib.pyplot as plt
 import pandas as pd
 import cv2
 import datetime
-from typing import List, Dict, Tuple
 from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader
+import pickle
+import hashlib
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ⚡ GPU预处理Dataset
+class ImageDatasetGPU(Dataset):
+    """GPU加速的图像加载（最小CPU预处理）"""
+    def __init__(self, image_paths):
+        self.image_paths = image_paths
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        path = self.image_paths[idx]
+        try:
+            img = Image.open(path).convert('RGB')
+            img_tensor = self.transform(img)
+            return img_tensor, path, True
+        except Exception as e:
+            return torch.zeros(3, 224, 224), path, False
+
+
+class ImageDataset(Dataset):
+    """标准Dataset（CPU预处理）"""
+    def __init__(self, image_paths, transform):
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        path = self.image_paths[idx]
+        try:
+            img = Image.open(path).convert('RGB')
+            img_tensor = self.transform(img)
+            return img_tensor, path, True
+        except Exception as e:
+            return torch.zeros(3, 518, 518), path, False
+
+
+class GPUPreprocessor(nn.Module):
+    """⚡ 在GPU上做resize和normalize"""
+    def __init__(self, image_size=518):
+        super().__init__()
+        self.image_size = image_size
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+    def forward(self, x):
+        x = F.interpolate(x, size=(self.image_size, self.image_size),
+                         mode='bilinear', align_corners=False)
+        x = (x - self.mean) / self.std
+        return x
+
+
+class PrefetchLoader:
+    """异步预加载到GPU"""
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream()
+
+    def __iter__(self):
+        first = True
+
+        for next_data in self.loader:
+            with torch.cuda.stream(self.stream):
+                next_data = [d.cuda(non_blocking=True) if isinstance(d, torch.Tensor) else d
+                            for d in next_data]
+
+            if not first:
+                yield current_data
+            else:
+                first = False
+
+            torch.cuda.current_stream().wait_stream(self.stream)
+            current_data = next_data
+
+        yield current_data
+
+    def __len__(self):
+        return len(self.loader)
+
 
 class AnomalyScreener:
-    """异常样本筛选器（供人工标注使用）"""
+    """异常样本筛选器（GPU预处理优化版）"""
 
     def __init__(self, config):
         self.config = config
         self.device = torch.device(config.DEVICE)
 
         print("="*70)
-        print("🎯 异常样本筛选系统（供人工标注）")
+        print("🚀 异常样本筛选系统（GPU预处理优化版）")
         print("="*70)
-        print(f"设备: {self.device}")
 
-        # ✅ 初始化标准预处理管道（遵循demo）
-        self.transform = self._get_dinov3_transform()
+        # ⚡ GPU预处理器
+        self.use_gpu_preprocessing = getattr(config, 'USE_GPU_PREPROCESSING', True)
 
-        # 加载DINOv3模型
+        if self.use_gpu_preprocessing:
+            print("⚡ GPU预处理: 已启用")
+            self.gpu_preprocessor = GPUPreprocessor(config.IMAGE_SIZE).to(self.device)
+            self.gpu_preprocessor.eval()
+            self.transform = None
+        else:
+            print("⚙️  CPU预处理")
+            self.transform = self._get_dinov3_transform()
+            self.gpu_preprocessor = None
+
+        self.use_amp = getattr(config, 'USE_AMP', True) and self.device.type == 'cuda'
+
+        # 缓存
+        self.cache_dir = Path(getattr(config, 'CACHE_DIR', 'cache'))
+        self.cache_dir.mkdir(exist_ok=True)
+
+        # 加载模型
         self.model = self._load_dinov3()
 
-        # 数据存储
+        # 数据
         self.all_features = None
         self.all_paths = None
         self.pca = None
-        self.scaler = None
 
     def _get_dinov3_transform(self):
-        """✅ DINOv3官方推荐的预处理管道（完全遵循demo）"""
+        """CPU预处理"""
         return transforms.Compose([
-            transforms.Resize(
-                (self.config.IMAGE_SIZE, self.config.IMAGE_SIZE),
-                interpolation=transforms.InterpolationMode.BICUBIC
-            ),
-            transforms.ToTensor(),  # 自动转为float32并归一化到[0,1]
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
+            transforms.Resize((self.config.IMAGE_SIZE, self.config.IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ])
 
     def _load_dinov3(self):
-        """加载DINOv3模型（严格遵循demo）"""
+        """加载DINOv3"""
         print(f"\n📥 加载DINOv3模型: {self.config.MODEL_NAME}")
 
-        # 添加DINOv3路径
         repo_root = self.config.DINOV3_REPO_ROOT
         sys.path.insert(0, repo_root)
 
-        # ✅ 正确的导入方式
         import dinov3.distributed as distributed
         from dinov3.configs import setup_config, DinoV3SetupArgs, setup_job
         from dinov3.models import build_model_for_eval
 
-        # 配置路径
         config_path = os.path.join(
             repo_root, "dinov3", "configs", "train", f"{self.config.MODEL_NAME}.yaml"
         )
 
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
-        # 初始化分布式环境
         output_dir = "./outputs/dinov3_tmp"
         os.makedirs(output_dir, exist_ok=True)
 
@@ -91,7 +180,6 @@ class AnomalyScreener:
             distributed_timeout=datetime.timedelta(minutes=30)
         )
 
-        # 创建配置
         setup_args = DinoV3SetupArgs(
             config_file=config_path,
             pretrained_weights=self.config.DINOV3_WEIGHT_PATH,
@@ -99,357 +187,214 @@ class AnomalyScreener:
             opts=[]
         )
 
-        # 加载配置和模型
         cfg = setup_config(setup_args, strict_cfg=False)
-        model = build_model_for_eval(
-            config=cfg,
-            pretrained_weights=self.config.DINOV3_WEIGHT_PATH
-        )
+        model = build_model_for_eval(config=cfg, pretrained_weights=self.config.DINOV3_WEIGHT_PATH)
 
-        # 设置为评估模式
         model.eval().to(self.device)
         for p in model.parameters():
             p.requires_grad = False
 
         print(f"✅ DINOv3模型加载完成")
-        print(f"   进程数: {distributed.get_world_size()}")
-
         return model
 
     def _get_image_paths(self, directory):
-        """获取所有图像路径"""
+        """获取图像路径"""
         extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.JPG', '.JPEG', '.PNG', '.BMP')
         paths = []
         directory = Path(directory)
         for ext in extensions:
-            paths.extend(directory.glob(f"*{ext}"))
-            paths.extend(directory.rglob(f"*{ext}"))  # 包含子目录
-        # 去重并排序
-        paths = sorted(list(set(paths)))
-        return [str(p) for p in paths]
+            paths.extend(directory.rglob(f"*{ext}"))
+        return sorted([str(p) for p in set(paths)])
+
+    def _get_cache_key(self, image_dir):
+        """缓存key"""
+        key_str = f"{image_dir}_{self.config.MODEL_NAME}_{self.config.IMAGE_SIZE}"
+        return hashlib.md5(key_str.encode()).hexdigest()[:16]
 
     @torch.no_grad()
-    def extract_all_features(self, image_dir=None):
-        """✅ 提取所有图像特征（完全遵循demo的批量处理方式）"""
+    def extract_all_features(self, image_dir=None, use_cache=True):
+        """⚡ GPU预处理版特征提取"""
         if image_dir is None:
             image_dir = self.config.IMAGE_DIR
 
         print("\n" + "="*70)
-        print("🔍 提取图像特征")
+        print("🔍 提取图像特征（GPU预处理优化）")
         print("="*70)
 
-        # 1. 获取所有图像
+        # 缓存检查
+        cache_key = self._get_cache_key(image_dir)
+        cache_file = self.cache_dir / f"features_{cache_key}.pkl"
+
+        if use_cache and cache_file.exists():
+            print(f"📦 加载缓存: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                cache_data = pickle.load(f)
+            self.all_features = cache_data['features']
+            self.all_paths = cache_data['paths']
+            print(f"✅ 缓存加载完成: {self.all_features.shape}")
+            return self.all_features, self.all_paths
+
+        # 获取图像
         image_paths = self._get_image_paths(image_dir)
         print(f"📂 找到图像: {len(image_paths)} 张")
 
-        if len(image_paths) == 0:
-            raise ValueError(f"未找到图像: {image_dir}")
+        # 选择Dataset
+        if self.use_gpu_preprocessing:
+            dataset = ImageDatasetGPU(image_paths)
+            print("⚡ 使用GPU预处理Dataset")
+        else:
+            dataset = ImageDataset(image_paths, self.transform)
+            print("⚙️  使用CPU预处理Dataset")
 
-        # 2. 批量提取特征（遵循demo）
+        # DataLoader
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.config.BATCH_SIZE,
+            shuffle=False,
+            num_workers=self.config.NUM_WORKERS,
+            pin_memory=True,
+            prefetch_factor=getattr(self.config, 'PREFETCH_FACTOR', 4),
+            persistent_workers=True if self.config.NUM_WORKERS > 0 else False,
+            drop_last=False,
+        )
+
+        # 异步加载
+        if self.use_gpu_preprocessing:
+            dataloader = PrefetchLoader(dataloader, self.device)
+            print("⚡ 使用异步GPU预加载")
+
+        print(f"⚡ 配置: BS={self.config.BATCH_SIZE}, Workers={self.config.NUM_WORKERS}")
+
+        # 提取特征
         features_list = []
         valid_paths = []
+        use_cls_token = getattr(self.config, 'USE_CLS_TOKEN', True)
 
-        for i in tqdm(range(0, len(image_paths), self.config.BATCH_SIZE),
-                     desc="提取特征"):
-            batch_paths = image_paths[i:i + self.config.BATCH_SIZE]
-            batch_images = []
-            batch_valid_paths = []
+        import time
+        total_images = 0
+        start_time = time.time()
 
-            # ✅ 批量加载图像（demo方式）
-            for path in batch_paths:
-                try:
-                    img = Image.open(path).convert('RGB')
-                    img_tensor = self.transform(img)  # 使用transforms管道
-                    batch_images.append(img_tensor)
-                    batch_valid_paths.append(path)
-                except Exception as e:
-                    print(f"⚠️  跳过 {path}: {e}")
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            for batch_tensors, batch_paths, batch_valid in tqdm(dataloader, desc="提取特征"):
+
+                if isinstance(batch_valid, torch.Tensor):
+                    valid_mask = batch_valid.cpu().numpy()
+                else:
+                    valid_mask = np.array(batch_valid)
+
+                if not valid_mask.any():
                     continue
 
-            if len(batch_images) == 0:
-                continue
-
-            # ✅ 批量推理（demo方式）
-            batch_tensor = torch.stack(batch_images).to(self.device)
-
-            # ✅ 使用forward_features提取（demo方式）
-            with torch.no_grad():
-                feats_dict = self.model.forward_features(batch_tensor)
-
-                # ✅ 提取patch tokens特征（demo推荐）
-                if 'x_norm_patchtokens' in feats_dict:
-                    feats = feats_dict['x_norm_patchtokens']
-                elif 'x_prenorm' in feats_dict:
-                    feats = feats_dict['x_prenorm']
+                # GPU预处理
+                if self.use_gpu_preprocessing:
+                    if not batch_tensors.is_cuda:
+                        batch_tensors = batch_tensors.cuda(non_blocking=True)
+                    batch_tensors = batch_tensors[valid_mask]
+                    batch_tensors = self.gpu_preprocessor(batch_tensors)
                 else:
-                    # 如果都没有，尝试取第一个tensor
-                    feats = list(feats_dict.values())[0]
+                    batch_tensors = batch_tensors[valid_mask].to(self.device, non_blocking=True)
 
-                # ✅ L2归一化（demo推荐）
-                if self.config.NORMALIZE_FEATURES:
+                batch_paths_valid = [p for p, v in zip(batch_paths, valid_mask) if v]
+
+                # 特征提取
+                feats_dict = self.model.forward_features(batch_tensors)
+
+                if use_cls_token:
+                    if 'x_norm_clstoken' in feats_dict:
+                        feats = feats_dict['x_norm_clstoken']
+                    elif 'x_prenorm' in feats_dict:
+                        feats = feats_dict['x_prenorm'][:, 0]
+                    else:
+                        feats = list(feats_dict.values())[0]
+                        if feats.dim() == 3:
+                            feats = feats[:, 0]
+                else:
+                    if 'x_norm_patchtokens' in feats_dict:
+                        feats = feats_dict['x_norm_patchtokens'].mean(dim=1)
+                    elif 'x_prenorm' in feats_dict:
+                        feats = feats_dict['x_prenorm'][:, 1:].mean(dim=1)
+                    else:
+                        feats = list(feats_dict.values())[0]
+                        if feats.dim() == 3:
+                            feats = feats.mean(dim=1)
+
+                if getattr(self.config, 'NORMALIZE_FEATURES', True):
                     feats = F.normalize(feats, dim=-1)
 
-                # ✅ Flatten patch维度（demo方式）
-                # feats shape: (batch, n_patches, dim)
-                if feats.dim() == 3:
-                    batch_size, n_patches, dim = feats.shape
-                    feats = feats.reshape(batch_size * n_patches, dim)
+                features_list.append(feats.cpu().half().numpy())
+                valid_paths.extend(batch_paths_valid)
+                total_images += len(batch_paths_valid)
 
-                features_list.append(feats.cpu().numpy())
+        elapsed = time.time() - start_time
+        print(f"\n⏱️  提取耗时: {elapsed:.1f}秒")
+        print(f"📊 速度: {total_images/elapsed:.1f} 张/秒")
+        print(f"💾 显存峰值: {torch.cuda.max_memory_allocated()/1024**3:.2f}GB")
 
-            valid_paths.extend(batch_valid_paths)
-
-        # 3. 合并特征
-        features = np.vstack(features_list)
+        # 合并特征
+        features = np.vstack(features_list).astype(np.float32)
         self.all_paths = valid_paths
-
         print(f"✅ 特征提取完成: {features.shape}")
 
-        # 4. 可选的PCA降维
-        if self.config.USE_PCA:
-            # 计算每张图的patch数量
-            n_images = len(valid_paths)
-            n_total_patches = features.shape[0]
-            patches_per_image = n_total_patches // n_images
+        # PCA
+        if getattr(self.config, 'USE_PCA', True):
+            pca_dim = min(self.config.PCA_DIM, features.shape[1], len(features) - 1)
+            print(f"📉 PCA降维: {features.shape[1]} → {pca_dim}")
 
-            print(f"📊 特征统计: {n_images} 张图像, 每张 {patches_per_image} 个patches")
+            if len(features) > 10000:
+                self.pca = IncrementalPCA(n_components=pca_dim, batch_size=1000)
+            else:
+                self.pca = PCA(n_components=pca_dim, random_state=42)
 
-            # 先对patch特征做平均，得到图像级特征
-            features_img = features.reshape(n_images, patches_per_image, -1).mean(axis=1)
+            features = self.pca.fit_transform(features)
 
-            pca_dim = min(self.config.PCA_DIM, features_img.shape[1], len(features_img) - 1)
-            print(f"📉 PCA降维: {features_img.shape[1]} → {pca_dim}")
-
-            self.pca = PCA(n_components=pca_dim, random_state=42)
-            features_img = self.pca.fit_transform(features_img)
-
-            var_ratio = self.pca.explained_variance_ratio_.sum()
-            print(f"   解释方差比: {var_ratio:.2%}")
-
-            self.all_features = features_img.astype(np.float32)
-        else:
-            # 不降维：直接对patch做平均得到图像级特征
-            n_images = len(valid_paths)
-            n_total_patches = features.shape[0]
-            patches_per_image = n_total_patches // n_images
-
-            features_img = features.reshape(n_images, patches_per_image, -1).mean(axis=1)
-            self.all_features = features_img.astype(np.float32)
-
+        self.all_features = features.astype(np.float32)
         print(f"📊 最终特征: {self.all_features.shape}")
+
+        # 保存缓存
+        if use_cache:
+            print(f"💾 保存缓存...")
+            with open(cache_file, 'wb') as f:
+                pickle.dump({'features': self.all_features, 'paths': self.all_paths}, f)
 
         return self.all_features, self.all_paths
 
     def compute_anomaly_scores(self):
-        """计算异常分数（多种方法融合）"""
+        """计算异常分数"""
         print("\n" + "="*70)
         print("💯 计算异常分数")
         print("="*70)
 
         scores_dict = {}
-        methods = self.config.METHODS
 
-        # 1. KNN距离
-        if 'knn' in methods:
-            print("📊 KNN距离...")
-            scores_dict['knn'] = self._compute_knn_score()
+        # KNN
+        if 'knn' in self.config.METHODS:
+            print("📊 KNN...")
+            k = min(10, len(self.all_features) - 1)
+            nbrs = NearestNeighbors(n_neighbors=k+1, n_jobs=-1)
+            nbrs.fit(self.all_features)
+            distances, _ = nbrs.kneighbors(self.all_features)
+            scores_dict['knn'] = distances[:, 1:].mean(axis=1)
 
-        # 2. LOF
-        if 'lof' in methods:
-            print("📊 局部离群因子(LOF)...")
-            scores_dict['lof'] = self._compute_lof_score()
+        # Isolation Forest
+        if 'isolation' in self.config.METHODS:
+            print("📊 Isolation Forest...")
+            iso = IsolationForest(contamination=0.1, random_state=42, n_jobs=-1)
+            iso.fit(self.all_features)
+            scores_dict['isolation'] = -iso.score_samples(self.all_features)
 
-        # 3. Isolation Forest
-        if 'isolation' in methods:
-            print("📊 孤立森林...")
-            scores_dict['isolation'] = self._compute_isolation_score()
-
-        # 4. 核密度估计
-        if 'density' in methods:
-            print("📊 核密度估计...")
-            scores_dict['density'] = self._compute_density_score()
-
-        # 5. 融合分数
-        print("🔄 融合异常分数...")
-        ensemble_score = self._ensemble_scores(scores_dict)
-        scores_dict['ensemble'] = ensemble_score
-
-        # 统计信息
-        print(f"\n📈 分数统计:")
-        for name, scores in scores_dict.items():
-            print(f"   {name:12s}: mean={scores.mean():.4f}, "
-                  f"std={scores.std():.4f}, "
-                  f"max={scores.max():.4f}")
+        # 融合
+        ensemble = np.mean([np.argsort(np.argsort(s))/(len(s)-1) for s in scores_dict.values()], axis=0)
+        scores_dict['ensemble'] = ensemble
 
         return scores_dict
 
-    def _compute_knn_score(self):
-        """KNN距离分数"""
-        k = min(self.config.KNN_K, len(self.all_features) - 1)
-        nbrs = NearestNeighbors(n_neighbors=k+1, metric='euclidean', n_jobs=-1)
-        nbrs.fit(self.all_features)
-        distances, _ = nbrs.kneighbors(self.all_features)
-
-        # 排除自身，取均值
-        knn_dist = distances[:, 1:].mean(axis=1)
-
-        return knn_dist
-
-    def _compute_lof_score(self):
-        """LOF分数"""
-        n_neighbors = min(self.config.LOF_NEIGHBORS, len(self.all_features) - 1)
-
-        lof = LocalOutlierFactor(
-            n_neighbors=n_neighbors,
-            contamination='auto',
-            n_jobs=-1
-        )
-
-        lof.fit(self.all_features)
-        # 负的离群因子，转为正值（越大越异常）
-        lof_scores = -lof.negative_outlier_factor_
-
-        return lof_scores
-
-    def _compute_isolation_score(self):
-        """孤立森林分数"""
-        iso = IsolationForest(
-            contamination=self.config.ISO_CONTAMINATION,
-            random_state=42,
-            n_jobs=-1
-        )
-
-        iso.fit(self.all_features)
-        # 异常分数（越负越异常，转为正值）
-        iso_scores = -iso.score_samples(self.all_features)
-
-        return iso_scores
-
-    def _compute_density_score(self):
-        """核密度估计分数"""
-        kde = KernelDensity(
-            bandwidth=self.config.DENSITY_BANDWIDTH,
-            kernel='gaussian'
-        )
-        kde.fit(self.all_features)
-
-        # 对数似然（越低越异常，取负）
-        log_density = kde.score_samples(self.all_features)
-        density_scores = -log_density
-
-        return density_scores
-
-    def _ensemble_scores(self, scores_dict):
-        """融合多个分数"""
-        if len(scores_dict) == 0:
-            raise ValueError("没有可用的异常分数")
-
-        # 归一化每个分数到[0, 1]
-        normalized = []
-
-        for name, scores in scores_dict.items():
-            # Min-Max归一化
-            min_val = scores.min()
-            max_val = scores.max()
-
-            if max_val > min_val:
-                norm_scores = (scores - min_val) / (max_val - min_val)
-            else:
-                norm_scores = np.zeros_like(scores)
-
-            normalized.append(norm_scores)
-
-        # 简单平均融合
-        ensemble = np.mean(normalized, axis=0)
-
-        return ensemble
-
     def select_samples_for_annotation(self, scores):
-        """选择样本供人工标注"""
-        print("\n" + "="*70)
-        print("🎯 筛选异常样本")
-        print("="*70)
-
-        # 确定筛选数量
-        if self.config.USE_TOP_K:
-            n_select = min(self.config.TOP_K, len(scores))
-        else:
-            n_select = int(len(scores) * self.config.TOP_PERCENT)
-
-        print(f"📌 筛选策略: {'Top-K' if self.config.USE_TOP_K else '百分比'}")
-        print(f"📌 筛选数量: {n_select} / {len(scores)} ({n_select/len(scores)*100:.1f}%)")
-
-        if self.config.USE_DIVERSITY_SAMPLING:
-            # 多样性采样：先聚类，再从每类选异常样本
-            selected_indices = self._diversity_sampling(scores, n_select)
-        else:
-            # 简单Top-K
-            selected_indices = np.argsort(scores)[-n_select:][::-1]
-
-        print(f"✅ 筛选完成: {len(selected_indices)} 个样本")
-
-        return selected_indices
-
-    def _diversity_sampling(self, scores, n_select):
-        """多样性采样（避免只选同一类异常）"""
-        print("🎨 使用多样性采样...")
-
-        # 1. 聚类
-        n_clusters = min(self.config.N_CLUSTERS, len(self.all_features) // 10)
-        n_clusters = max(2, n_clusters)  # 至少2个类
-
-        print(f"   聚类数: {n_clusters}")
-
-        kmeans = MiniBatchKMeans(
-            n_clusters=n_clusters,
-            random_state=42,
-            batch_size=min(1024, len(self.all_features)),
-            n_init=3
-        )
-        cluster_labels = kmeans.fit_predict(self.all_features)
-
-        # 2. 每个类选异常分数最高的样本
-        samples_per_cluster = max(1, n_select // n_clusters)
-
-        selected_indices = []
-
-        for cluster_id in range(n_clusters):
-            cluster_mask = cluster_labels == cluster_id
-            cluster_indices = np.where(cluster_mask)[0]
-
-            if len(cluster_indices) == 0:
-                continue
-
-            # 在该类中选异常分数最高的
-            cluster_scores = scores[cluster_indices]
-            n_select_cluster = min(samples_per_cluster, len(cluster_indices))
-            top_in_cluster = np.argsort(cluster_scores)[-n_select_cluster:][::-1]
-
-            selected_indices.extend(cluster_indices[top_in_cluster])
-
-        # 3. 如果不够，补充全局Top
-        if len(selected_indices) < n_select:
-            remaining = n_select - len(selected_indices)
-            all_top = np.argsort(scores)[::-1]
-
-            for idx in all_top:
-                if idx not in selected_indices:
-                    selected_indices.append(idx)
-                    if len(selected_indices) >= n_select:
-                        break
-
-        # 4. 按分数排序
-        selected_indices = np.array(selected_indices[:n_select])
-        selected_scores = scores[selected_indices]
-        sort_order = np.argsort(selected_scores)[::-1]
-        selected_indices = selected_indices[sort_order]
-
-        print(f"   采样分布: 每类约{samples_per_cluster}个")
-
-        return selected_indices
+        """筛选样本"""
+        n_select = self.config.TOP_K if self.config.USE_TOP_K else int(len(scores) * self.config.TOP_PERCENT)
+        return np.argsort(scores)[-n_select:][::-1]
 
     def save_results(self, scores_dict, selected_indices):
-        """保存筛选结果"""
+        """保存结果（完整版）"""
         output_dir = Path(self.config.OUTPUT_DIR)
         output_dir.mkdir(exist_ok=True)
 
@@ -457,39 +402,35 @@ class AnomalyScreener:
         print("💾 保存结果")
         print("="*70)
 
-        # 1. 完整结果CSV（所有图像）
+        # 1. 完整CSV
         df_all = pd.DataFrame({
             'image_path': self.all_paths,
             'image_name': [Path(p).name for p in self.all_paths],
             'ensemble_score': scores_dict['ensemble'],
         })
 
-        # 添加各指标分数
         for name, scores in scores_dict.items():
             if name != 'ensemble':
                 df_all[f'{name}_score'] = scores
 
-        # 添加是否被选中标记
         df_all['selected_for_annotation'] = 0
         df_all.loc[selected_indices, 'selected_for_annotation'] = 1
-
-        # 按分数排序
         df_all = df_all.sort_values('ensemble_score', ascending=False)
 
         csv_all = output_dir / 'all_images_with_scores.csv'
         df_all.to_csv(csv_all, index=False, encoding='utf-8-sig')
         print(f"📄 完整结果: {csv_all}")
 
-        # 2. 筛选出的异常样本CSV（供标注）
+        # 2. 筛选样本CSV
         df_selected = df_all[df_all['selected_for_annotation'] == 1].copy()
-        df_selected['annotation_label'] = ''  # 空列供人工填写
-        df_selected['annotation_notes'] = ''  # 备注列
+        df_selected['annotation_label'] = ''
+        df_selected['annotation_notes'] = ''
 
         csv_selected = output_dir / 'samples_for_annotation.csv'
         df_selected.to_csv(csv_selected, index=False, encoding='utf-8-sig')
-        print(f"📄 待标注样本: {csv_selected} ({len(df_selected)} 个)")
+        print(f"📄 待标注: {csv_selected} ({len(df_selected)} 个)")
 
-        # 3. 统计摘要
+        # 3. 摘要
         summary = {
             '总图像数': len(self.all_paths),
             '筛选数量': len(selected_indices),
@@ -507,15 +448,13 @@ class AnomalyScreener:
             f.write("="*70 + "\n\n")
             for k, v in summary.items():
                 f.write(f"{k:20s}: {v}\n")
-
         print(f"📄 摘要: {summary_file}")
 
-        # 4. 可视化
-        if self.config.SAVE_VISUALIZATIONS:
+        # 4. ✅ 可视化
+        if getattr(self.config, 'SAVE_VISUALIZATIONS', True):
             self._visualize_results(scores_dict, selected_indices, output_dir)
 
-        print(f"\n📁 所有结果已保存到: {output_dir}")
-
+        print(f"\n📁 所有结果已保存到: {output_dir.absolute()}")
         return csv_selected
 
     def _visualize_results(self, scores_dict, selected_indices, output_dir):
@@ -524,30 +463,26 @@ class AnomalyScreener:
 
         scores = scores_dict['ensemble']
 
-        # 1. 分数分布图
+        # 1. 分数分布
         plt.figure(figsize=(12, 6))
 
         plt.subplot(1, 2, 1)
         plt.hist(scores, bins=100, alpha=0.7, color='skyblue', edgecolor='black')
-
-        # 标记选中样本的分数范围
         selected_scores = scores[selected_indices]
         threshold = selected_scores.min()
         plt.axvline(threshold, color='red', linestyle='--', linewidth=2,
-                   label=f'Selection Threshold: {threshold:.3f}')
-
+                   label=f'Threshold: {threshold:.3f}')
         plt.xlabel('Anomaly Score', fontsize=12)
         plt.ylabel('Count', fontsize=12)
-        plt.title('Score Distribution (All Images)', fontsize=14)
+        plt.title('Score Distribution (All)', fontsize=14)
         plt.legend()
         plt.grid(True, alpha=0.3)
 
-        # 2. 选中样本的分数分布
         plt.subplot(1, 2, 2)
         plt.hist(selected_scores, bins=50, alpha=0.7, color='salmon', edgecolor='black')
         plt.xlabel('Anomaly Score', fontsize=12)
         plt.ylabel('Count', fontsize=12)
-        plt.title('Score Distribution (Selected for Annotation)', fontsize=14)
+        plt.title('Score Distribution (Selected)', fontsize=14)
         plt.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -555,14 +490,16 @@ class AnomalyScreener:
         plt.close()
         print("   ✓ 分数分布图")
 
-        # 3. Top异常样本可视化
-        viz_k = min(self.config.VIZ_TOP_K, len(selected_indices))
-        top_indices = selected_indices[:viz_k]
+        # 2. ✅ Top异常样本
+        viz_k = min(getattr(self.config, 'VIZ_TOP_K', 100), len(selected_indices))
+        print(f"   生成Top-{viz_k}异常样本图...")
 
-        n_cols = self.config.GRID_COLS
+        top_indices = selected_indices[:viz_k]
+        n_cols = getattr(self.config, 'GRID_COLS', 5)
         n_rows = (viz_k + n_cols - 1) // n_cols
 
         fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 4*n_rows))
+
         if n_rows == 1 and n_cols == 1:
             axes = np.array([axes])
         elif n_rows == 1 or n_cols == 1:
@@ -579,20 +516,23 @@ class AnomalyScreener:
 
             try:
                 img = cv2.imread(img_path)
-                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                if img is not None:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                else:
+                    img = np.zeros((224, 224, 3), dtype=np.uint8)
             except:
                 img = np.zeros((224, 224, 3), dtype=np.uint8)
 
             axes[i].imshow(img)
-            axes[i].set_title(f'Rank {i+1}\nScore: {score:.4f}\n{Path(img_path).name}',
-                            fontsize=9)
+            axes[i].set_title(f'#{i+1} | Score: {score:.4f}\n{Path(img_path).name}',
+                            fontsize=8)
             axes[i].axis('off')
 
-        # 隐藏多余子图
         for i in range(len(top_indices), len(axes)):
             axes[i].axis('off')
 
         plt.tight_layout()
-        plt.savefig(output_dir / f'top_{viz_k}_anomalies.png', dpi=150, bbox_inches='tight')
+        viz_file = output_dir / f'top_{viz_k}_anomalies.png'
+        plt.savefig(viz_file, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"   ✓ Top-{viz_k} 异常样本图")
+        print(f"   ✓ Top-{viz_k}异常样本图: {viz_file}")
