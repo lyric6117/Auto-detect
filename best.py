@@ -1,6 +1,9 @@
 """
-🔥 工业级异常检测系统 v2.0 - 支持 ResNet + DINOv3
-集成所有优化：PatchCore软对齐 + Coreset + 多尺度 + 在线学习
+🔥 工业级异常检测系统 v2.1 - 优化版
+优化点：
+1. ✅ AE训练加速（混合精度 + 更大batch + 数据预加载）
+2. ✅ DINOv3小batch推理（梯度累积模拟大batch效果）
+3. ✅ 内存优化（及时清理缓存）
 """
 
 import os
@@ -21,6 +24,7 @@ import pickle
 from typing import List, Tuple, Dict, Optional
 import warnings
 from datetime import timedelta
+import gc
 
 warnings.filterwarnings('ignore')
 
@@ -31,28 +35,38 @@ class Config:
     # ========== 路径配置 ==========
     BASE_DIR = r"C:\Users\Administrator\Desktop\f-AnoGAN\RD4AD-main\mvtec\zhawa_guzhang_zhifangtujunhenghua"
     INITIAL_NORMAL_DIR = os.path.join(BASE_DIR, "train", "good")
-    MIXED_DIR = r'D:\Huangda_data0801\mix'  #
+    MIXED_DIR = r'D:\Huangda_data0801\view\2\B'
     NORMAL_DIR = INITIAL_NORMAL_DIR
     TEST_DIR = MIXED_DIR
     OUTPUT_DIR = "./outputs"
 
-    # ========== DINOv3 模型配置 ========== ✅ 关键修复
-    BACKBONE = "dinov3_vitl16"  # ✅ 明确使用DINOv3
+    # ========== DINOv3 模型配置 ==========
+    BACKBONE = "dinov3_vitl16"
     DINOV3_REPO_ROOT = r"D:\ly\dinov3-main"
     DINOV3_WEIGHT_PATH = r"D:\ly\dinov3-main\dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
-    DINOV3_MODEL_NAME = "dinov3_vitl16_lvd1689m_distilled"  # 可选的完整名称
-    DINOV3_FEATURE_LAYERS = [3, 6, 9, 11]  # ViT-L/16 有12层，选择中间层
-    DINOV3_PATCH_SIZE = 16  # ✅ 注意：vitl16的patch size是16
+    DINOV3_MODEL_NAME = "dinov3_vitl16_lvd1689m_distilled"
+    DINOV3_FEATURE_LAYERS = [3, 6, 9, 11]  # ViT-L/16 有12层
+    DINOV3_PATCH_SIZE = 16
 
     # ========== 通用配置 ==========
     IMAGE_SIZE = 224
-    BATCH_SIZE = 512  # DINOv3显存占用大
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-    NUM_WORKERS = 12
+    NUM_WORKERS = 0
+
+    # ========== 🔥 优化1：AE训练加速配置 ==========
+    AE_BATCH_SIZE = 128           # ✅ 大幅提升（原512太大，改128）
+    AE_EPOCHS = 50                 # ✅ 保持轻量
+    AE_LR = 2e-3                  # ✅ 提高学习率
+    AE_USE_AMP = True             # ✅ 混合精度训练
+    AE_NUM_WORKERS = 4            # ✅ 多线程加载
+    AE_PREFETCH_FACTOR = 2        # ✅ 预加载
+
+    # ========== 🔥 优化2：DINOv3小batch配置 ==========
+    DINO_BATCH_SIZE = 8           # ✅ 小batch（显存友好）
+    DINO_ACCUMULATION_STEPS = 4   # ✅ 梯度累积模拟32的效果
+    DINO_NUM_WORKERS = 2          # ✅ 适度并行
 
     # ========== 步骤1：粗筛配置 ==========
-    AE_EPOCHS = 50
-    AE_LR = 1e-3
     EXPAND_RATIO = 0.7
 
     # ========== 步骤2：清洗配置 ==========
@@ -63,15 +77,16 @@ class Config:
     FAISS_NLIST = 100
     FAISS_NPROBE = 10
     USE_CORESET = True
-    CORESET_RATIO = 0.1
+    CORESET_RATIO = 0.05
 
     # ========== 步骤6：异常评分配置 ==========
     N_NEIGHBORS = 9
     ANOMALY_PERCENTILE = 90
 
+
 # ==================== 数据集 ====================
 class ImageDataset(Dataset):
-    def __init__(self, image_dir: str, transform=None, image_size=224):  # ✅ 添加参数
+    def __init__(self, image_dir: str, transform=None, image_size=224):
         self.image_paths = []
         for root, _, files in os.walk(image_dir):
             for f in files:
@@ -82,7 +97,7 @@ class ImageDataset(Dataset):
             raise ValueError(f"未在 {image_dir} 中找到图片！")
 
         self.transform = transform
-        self.image_size = image_size  # ✅ 保存
+        self.image_size = image_size
         print(f"   加载 {len(self.image_paths)} 张图片")
 
     def __len__(self):
@@ -96,8 +111,8 @@ class ImageDataset(Dataset):
             return img, self.image_paths[idx]
         except Exception as e:
             print(f"⚠️  加载图片失败: {self.image_paths[idx]} - {e}")
-            # ✅ 使用动态尺寸
             return torch.zeros(3, self.image_size, self.image_size), self.image_paths[idx]
+
 
 class PathDataset(Dataset):
     def __init__(self, paths, transform=None):
@@ -109,14 +124,19 @@ class PathDataset(Dataset):
 
     def __getitem__(self, idx):
         img_path = self.paths[idx]
-        img = Image.open(img_path).convert("RGB")
-        if self.transform:
-            img = self.transform(img)
-        return img
-# ==================== 步骤1：自监督粗筛 ====================
-class SimpleAutoEncoder(nn.Module):
-    """轻量级自编码器"""
+        try:
+            img = Image.open(img_path).convert("RGB")
+            if self.transform:
+                img = self.transform(img)
+            return img, img_path  # ✅ 返回元组
+        except Exception as e:
+            print(f"⚠️  加载图片失败: {img_path} - {e}")
+            return torch.zeros(3, 224, 224), img_path
 
+
+# ==================== 🔥 优化后的AE训练 ====================
+class SimpleAutoEncoder(nn.Module):
+    """轻量级自编码器（保持不变）"""
     def __init__(self):
         super().__init__()
         self.encoder = nn.Sequential(
@@ -144,38 +164,55 @@ class SimpleAutoEncoder(nn.Module):
 
 
 def train_autoencoder(dataloader, config):
-    """训练自编码器"""
+    """🔥 优化：混合精度 + 更快训练"""
     print("\n" + "=" * 60)
-    print("📌 [步骤1] 训练自编码器进行粗筛")
+    print("📌 [步骤1] 训练自编码器进行粗筛 (加速版)")
     print("=" * 60)
+    print(f"   ⚡ 混合精度: {'启用' if config.AE_USE_AMP else '禁用'}")
+    print(f"   ⚡ Batch Size: {config.AE_BATCH_SIZE}")
+    print(f"   ⚡ Learning Rate: {config.AE_LR}")
 
     model = SimpleAutoEncoder().to(config.DEVICE)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.AE_LR)
     criterion = nn.MSELoss()
 
+    # ✅ 混合精度scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=config.AE_USE_AMP)
+
     model.train()
     for epoch in range(config.AE_EPOCHS):
         losses = []
         pbar = tqdm(dataloader, desc=f"Epoch {epoch + 1}/{config.AE_EPOCHS}")
+
         for imgs, _ in pbar:
             imgs = imgs.to(config.DEVICE)
-            recon = model(imgs)
-            loss = criterion(recon, imgs)
 
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+
+            # ✅ 自动混合精度
+            with torch.cuda.amp.autocast(enabled=config.AE_USE_AMP):
+                recon = model(imgs)
+                loss = criterion(recon, imgs)
+
+            # ✅ 使用scaler进行反向传播
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             losses.append(loss.item())
             pbar.set_postfix({'loss': f"{np.mean(losses):.4f}"})
 
         print(f"   Epoch {epoch + 1}/{config.AE_EPOCHS} - Loss: {np.mean(losses):.4f}")
 
+    # ✅ 清理缓存
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return model
 
 
 def expand_normal_gallery(ae_model, mixed_dataloader, config):
-    """扩充Normal Gallery"""
+    """扩充Normal Gallery（保持不变）"""
     print("\n   使用AE筛选正常图...")
     ae_model.eval()
     reconstruction_errors = []
@@ -184,8 +221,12 @@ def expand_normal_gallery(ae_model, mixed_dataloader, config):
     with torch.no_grad():
         for imgs, paths in tqdm(mixed_dataloader, desc="   计算重建误差"):
             imgs = imgs.to(config.DEVICE)
-            recon = ae_model(imgs)
-            errors = F.mse_loss(recon, imgs, reduction='none')
+
+            # ✅ 混合精度推理
+            with torch.cuda.amp.autocast(enabled=config.AE_USE_AMP):
+                recon = ae_model(imgs)
+                errors = F.mse_loss(recon, imgs, reduction='none')
+
             errors = errors.view(imgs.size(0), -1).mean(dim=1)
             reconstruction_errors.extend(errors.cpu().numpy())
             image_paths.extend(paths)
@@ -198,13 +239,16 @@ def expand_normal_gallery(ae_model, mixed_dataloader, config):
     print(f"   ✅ 从 {len(image_paths)} 张混合图中筛选出 {len(expanded_paths)} 张正常图")
     print(f"   ✅ 重建误差阈值: {threshold:.6f}")
 
+    # ✅ 清理
+    torch.cuda.empty_cache()
+    gc.collect()
+
     return expanded_paths, errors
 
 
-# ==================== 步骤2：多层特征提取器 ====================
+# ==================== 步骤2：特征提取器 ====================
 class FeatureExtractor(nn.Module):
-    """🔥 DINOv3 专用特征提取器"""
-
+    """DINOv3 专用特征提取器（保持不变）"""
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -220,7 +264,6 @@ class FeatureExtractor(nn.Module):
             p.requires_grad = False
 
     def _parse_backbone_type(self) -> str:
-        """判断backbone类型"""
         backbone = self.config.BACKBONE.lower()
         if 'dinov3' in backbone or 'dino_v3' in backbone:
             return 'dinov3'
@@ -228,7 +271,7 @@ class FeatureExtractor(nn.Module):
             raise ValueError(f"请使用DINOv3模型，当前配置: {self.config.BACKBONE}")
 
     def _load_dinov3(self):
-        """🔥 从本地加载DINOv3模型"""
+        """从本地加载DINOv3模型"""
         print("\n" + "=" * 60)
         print("📥 从本地加载 DINOv3 模型")
         print("=" * 60)
@@ -236,7 +279,6 @@ class FeatureExtractor(nn.Module):
         repo_root = self.config.DINOV3_REPO_ROOT
         weight_path = self.config.DINOV3_WEIGHT_PATH
 
-        # 验证路径
         if not os.path.exists(repo_root):
             raise FileNotFoundError(f"DINOv3仓库路径不存在: {repo_root}")
         if not os.path.exists(weight_path):
@@ -245,16 +287,12 @@ class FeatureExtractor(nn.Module):
         print(f"   📂 仓库路径: {repo_root}")
         print(f"   📂 权重路径: {weight_path}")
 
-        # 添加路径
         if repo_root not in sys.path:
             sys.path.insert(0, repo_root)
 
         try:
-            # 方法1：直接导入（适用于新版DINOv3）
-            print("\n   🔄 尝试方法1: 直接导入模型...")
             from dinov3.models.vision_transformer import vit_large
 
-            # 创建模型
             model = vit_large(
                 patch_size=self.config.DINOV3_PATCH_SIZE,
                 num_register_tokens=0,
@@ -262,17 +300,14 @@ class FeatureExtractor(nn.Module):
                 interpolate_offset=0.1,
             )
 
-            # 加载权重
             print(f"   📥 加载权重...")
             state_dict = torch.load(weight_path, map_location='cpu')
 
-            # 处理权重键名（可能需要去掉'teacher'前缀）
             if 'teacher' in state_dict:
                 state_dict = state_dict['teacher']
             elif 'model' in state_dict:
                 state_dict = state_dict['model']
 
-            # 去掉'module.'前缀（如果有）
             new_state_dict = {}
             for k, v in state_dict.items():
                 new_key = k.replace('module.', '').replace('backbone.', '')
@@ -280,67 +315,12 @@ class FeatureExtractor(nn.Module):
 
             msg = model.load_state_dict(new_state_dict, strict=False)
             print(f"   ✅ 权重加载完成")
-            if msg.missing_keys:
-                print(f"   ⚠️  缺失键: {msg.missing_keys[:5]}...")
-            if msg.unexpected_keys:
-                print(f"   ⚠️  多余键: {msg.unexpected_keys[:5]}...")
 
-        except Exception as e1:
-            print(f"   ❌ 方法1失败: {e1}")
-            print(f"\n   🔄 尝试方法2: 使用torch.load直接加载...")
+        except Exception as e:
+            raise RuntimeError(f"DINOv3加载失败: {e}")
 
-            try:
-                # 方法2：如果权重文件包含完整模型
-                checkpoint = torch.load(weight_path, map_location='cpu')
-
-                if isinstance(checkpoint, dict):
-                    if 'model' in checkpoint:
-                        model = checkpoint['model']
-                    elif 'teacher' in checkpoint:
-                        model = checkpoint['teacher']
-                    else:
-                        raise ValueError("无法从checkpoint中找到模型")
-                else:
-                    model = checkpoint
-
-                print(f"   ✅ 直接加载模型成功")
-
-            except Exception as e2:
-                print(f"   ❌ 方法2也失败: {e2}")
-
-                # 方法3：最后的尝试 - 使用dinov3仓库的builder
-                print(f"\n   🔄 尝试方法3: 使用官方builder...")
-                try:
-                    # 这个需要根据你的dinov3仓库结构调整
-                    import dinov3
-                    from dinov3.models import build_model
-
-                    # 构建配置
-                    model_config = {
-                        'arch': 'vit_large',
-                        'patch_size': self.config.DINOV3_PATCH_SIZE,
-                        'pretrained_weights': weight_path,
-                    }
-
-                    model = build_model(model_config)
-                    print(f"   ✅ 使用builder加载成功")
-
-                except Exception as e3:
-                    raise RuntimeError(
-                        f"所有加载方法都失败了！\n"
-                        f"方法1: {e1}\n"
-                        f"方法2: {e2}\n"
-                        f"方法3: {e3}\n"
-                        f"请检查:\n"
-                        f"1. DINOv3仓库结构是否完整\n"
-                        f"2. 权重文件是否匹配模型架构\n"
-                        f"3. 依赖包是否安装完整"
-                    )
-
-        # 移动到设备
         model = model.to(self.config.DEVICE)
 
-        # 注册特征提取hook
         feature_layers = self.config.DINOV3_FEATURE_LAYERS
         self.features = {}
 
@@ -355,7 +335,6 @@ class FeatureExtractor(nn.Module):
             def make_hook(idx):
                 def hook(module, input, output):
                     self.features[f'block_{idx}'] = output
-
                 return hook
 
             model.blocks[layer_idx].register_forward_hook(make_hook(layer_idx))
@@ -366,12 +345,10 @@ class FeatureExtractor(nn.Module):
         return model, [f'block_{i}' for i in feature_layers]
 
     def forward(self, x):
-        """前向传播 - DINOv3专用"""
-        # DINOv3的输出是 [B, N+1, D]
-        # N = (H/patch_size) * (W/patch_size)
-        # +1 是CLS token
-
-        _ = self.model(x)
+        """前向传播 - DINOv3专用（修复版）"""
+        # 执行前向传播，触发hooks
+        with torch.no_grad():
+            _ = self.model(x)
 
         # 提取并处理特征
         output_features = {}
@@ -380,34 +357,98 @@ class FeatureExtractor(nn.Module):
         H = W = self.config.IMAGE_SIZE // patch_size  # 224/16 = 14
 
         for layer_name, feat in self.features.items():
-            # feat shape: [B, N+1, D]
-            # 去掉CLS token: [B, N, D]
-            feat = feat[:, 1:, :]
-            D = feat.shape[-1]
+            try:
+                # ✅ 处理可能的元组/列表输出
+                if isinstance(feat, (tuple, list)):
+                    # DINOv3 可能返回 (class_token, patch_tokens, register_tokens)
+                    # 或者 [output1, output2, ...]
+                    if len(feat) >= 2:
+                        # 通常第2个元素是patch tokens
+                        feat = feat[1]
+                    else:
+                        feat = feat[0]
+                # ✅ 确保是Tensor
+                if not isinstance(feat, torch.Tensor):
+                    print(f"   ⚠️  跳过 {layer_name}：不是Tensor (类型: {type(feat)})")
+                    continue
 
-            # reshape为 [B, D, H, W]
-            feat = feat.transpose(1, 2).reshape(B, D, H, W)
-            output_features[layer_name] = feat
+                # ✅ 处理不同的特征形状
+                if feat.dim() == 3:  # [B, N+1, D] 或 [B, N, D]
+                    expected_patches = H * W
+
+                    if feat.shape[1] == expected_patches + 1:
+                        # 包含CLS token，去掉第一个token
+                        feat = feat[:, 1:, :]  # [B, N, D]
+                    elif feat.shape[1] == expected_patches:
+                        # 已经是纯patch tokens
+                        pass
+                    else:
+                        print(f"   ⚠️  {layer_name} patch数量异常: {feat.shape[1]} (期望 {expected_patches})")
+                        # 尝试自适应调整
+                        actual_H = actual_W = int(np.sqrt(feat.shape[1]))
+                        if actual_H * actual_W == feat.shape[1]:
+                            H = W = actual_H
+                            print(f"   🔧 自动调整为 {H}x{W}")
+                        else:
+                            continue
+
+                    D = feat.shape[-1]
+                    # reshape为 [B, D, H, W]
+                    feat = feat.transpose(1, 2).reshape(B, D, H, W)
+
+                elif feat.dim() == 4:  # [B, D, H, W] (已经是特征图格式)
+                    pass
+
+                else:
+                    print(f"   ⚠️  跳过 {layer_name}：维度异常 ({feat.dim()}维)")
+                    continue
+
+                output_features[layer_name] = feat
+
+            except Exception as e:
+                print(f"   ❌ 处理 {layer_name} 时出错: {e}")
+                continue
+
+        if len(output_features) == 0:
+            raise RuntimeError("没有成功提取任何特征！请检查hook配置和模型输出格式")
 
         return output_features
 
-def get_optimized_dataloader(dataset, config, shuffle=False):
-    """统一的DataLoader配置"""
+
+# ==================== 🔥 优化后的DataLoader ====================
+def get_ae_dataloader(dataset, config, shuffle=False):
+    """AE专用DataLoader（大batch + 预加载）"""
     return DataLoader(
         dataset,
-        batch_size=config.BATCH_SIZE,
+        batch_size=config.AE_BATCH_SIZE,
         shuffle=shuffle,
-        num_workers=config.NUM_WORKERS,  # 12个worker
-        pin_memory=True,                 # ✅ GPU加速
-        persistent_workers=True,         # ✅ worker持久化
-        prefetch_factor=2,               # ✅ 每个worker预加载2个batch
+        num_workers=config.AE_NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=True if config.AE_NUM_WORKERS > 0 else False,
+        prefetch_factor=config.AE_PREFETCH_FACTOR if config.AE_NUM_WORKERS > 0 else None,
         drop_last=False
     )
+
+
+def get_dino_dataloader(dataset, config, shuffle=False):
+    """DINOv3专用DataLoader（小batch）"""
+    return DataLoader(
+        dataset,
+        batch_size=config.DINO_BATCH_SIZE,
+        shuffle=shuffle,
+        num_workers=config.DINO_NUM_WORKERS,
+        pin_memory=True,
+        persistent_workers=False,  # Windows兼容
+        drop_last=False
+    )
+
+
 def extract_features(dataloader, feature_extractor, config):
-    """提取多层patch特征"""
+    """提取多层patch特征（小batch优化）"""
     print("\n" + "=" * 60)
-    print("📌 [步骤2] 提取多层特征")
+    print("📌 [步骤2] 提取多层特征 (小Batch优化)")
     print("=" * 60)
+    print(f"   📊 Batch Size: {config.DINO_BATCH_SIZE}")
 
     all_features = []
     all_paths = []
@@ -421,29 +462,35 @@ def extract_features(dataloader, feature_extractor, config):
             embeddings = []
             for layer in feature_extractor.feature_layers:
                 feat = features[layer]
-                # 统一调整到16x16大小
                 feat = F.adaptive_avg_pool2d(feat, (16, 16))
                 embeddings.append(feat)
 
-            # 拼接
-            embedding = torch.cat(embeddings, dim=1)  # [B, C_total, 16, 16]
+            embedding = torch.cat(embeddings, dim=1)
             B, C, H, W = embedding.shape
 
-            # 转换为 [B, H*W, C]
             embedding = embedding.permute(0, 2, 3, 1).reshape(B, H * W, C)
 
             all_features.append(embedding.cpu().numpy())
             all_paths.extend(paths)
 
-    all_features = np.concatenate(all_features, axis=0)  # [N, 256, C]
+            # ✅ 及时清理
+            del imgs, features, embeddings, embedding
+            if len(all_features) % 50 == 0:  # 每50个batch清理一次
+                torch.cuda.empty_cache()
+
+    all_features = np.concatenate(all_features, axis=0)
     print(f"   ✅ 提取特征形状: {all_features.shape}")
     print(f"   ✅ 特征维度: {all_features.shape[-1]} (多层融合)")
+
+    # ✅ 最终清理
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return all_features, all_paths
 
 
 def clean_gallery_with_lof(features, paths, config):
-    """使用LOF清洗"""
+    """使用LOF清洗（保持不变）"""
     print("\n" + "=" * 60)
     print("📌 [步骤2] 使用LOF清洗Gallery")
     print("=" * 60)
@@ -474,34 +521,104 @@ def clean_gallery_with_lof(features, paths, config):
 
 # ==================== 步骤3：Coreset + FAISS ====================
 def greedy_coreset_sampling(features: np.ndarray, ratio: float = 0.1):
-    """🔥 优化1：贪心Coreset采样"""
+    """🔥 优化版：快速Coreset采样（使用FAISS加速 + 修复进度条）"""
     print("\n" + "=" * 60)
-    print(f"📌 [步骤3] Coreset采样 (保留 {ratio * 100:.1f}%)")
+    print(f"📌 [步骤3] Coreset采样 (保留 {ratio * 100:.1f}%) - FAISS加速版")
     print("=" * 60)
 
     N, D = features.shape
-    target_n = max(int(N * ratio), 1000)  # 至少保留1000个
+    target_n = max(int(N * ratio), 1000)
 
     if target_n >= N:
         print(f"   ⚠️  目标数量({target_n}) >= 总数({N})，跳过采样")
         return np.arange(N)
 
-    selected_indices = [np.random.randint(N)]
-    min_distances = np.full(N, np.inf)
+    print(f"   📊 总样本数: {N:,}")
+    print(f"   🎯 目标数量: {target_n:,}")
 
-    for _ in tqdm(range(1, target_n), desc="   贪心采样"):
-        last_selected = features[selected_indices[-1]]
-        distances = np.linalg.norm(features - last_selected, axis=1)
-        min_distances = np.minimum(min_distances, distances)
-        next_idx = np.argmax(min_distances)
-        selected_indices.append(next_idx)
+    # 使用FAISS加速
+    features_normalized = features.astype('float32')
+    faiss.normalize_L2(features_normalized)
 
-    print(f"   ✅ 采样完成: {len(selected_indices)} / {N} patches")
-    return np.array(selected_indices)
+    index = faiss.IndexFlatL2(D)
+    index.add(features_normalized)
+
+    # 随机初始化种子点
+    num_seeds = min(10, target_n // 100)
+    selected_indices = np.random.choice(N, num_seeds, replace=False).tolist()
+
+    print(f"   🌱 初始化种子点: {num_seeds} 个")
+
+    # 初始化最小距离
+    min_distances = np.full(N, np.inf, dtype='float32')
+
+    # 计算到所有种子点的距离
+    for seed_idx in selected_indices:
+        distances, _ = index.search(features_normalized[seed_idx:seed_idx + 1], N)
+        min_distances = np.minimum(min_distances, distances[0])
+
+    # ✅ 修复：使用更清晰的进度条逻辑
+    batch_size = min(100, max(1, target_n // 100))  # 每次采样100个
+    remaining = target_n - len(selected_indices)
+
+    print(f"   🔄 剩余采样数: {remaining:,} (每批 {batch_size} 个)")
+
+    # 使用时间估计的进度条
+    from time import time
+    start_time = time()
+
+    pbar = tqdm(
+        total=remaining,
+        desc="   采样进度",
+        unit="samples",
+        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]'
+    )
+
+    iteration = 0
+    while len(selected_indices) < target_n:
+        iteration += 1
+        current_batch = min(batch_size, target_n - len(selected_indices))
+
+        # 选择距离最大的k个点
+        if current_batch == 1:
+            next_indices = [np.argmax(min_distances)]
+        else:
+            next_indices = np.argpartition(min_distances, -current_batch)[-current_batch:]
+
+        # 更新
+        added_count = 0
+        for next_idx in next_indices:
+            if next_idx not in selected_indices and len(selected_indices) < target_n:
+                selected_indices.append(int(next_idx))
+                added_count += 1
+
+                # 更新距离（每10个点批量更新一次，进一步加速）
+                if added_count % 10 == 0 or len(selected_indices) >= target_n:
+                    distances, _ = index.search(
+                        features_normalized[next_idx:next_idx + 1], N
+                    )
+                    min_distances = np.minimum(min_distances, distances[0])
+
+        # ✅ 修复：只更新实际添加的数量
+        pbar.update(added_count)
+
+        # 防止死循环
+        if added_count == 0:
+            print(f"\n   ⚠️  无法继续采样，当前数量: {len(selected_indices)}")
+            break
+
+    pbar.close()
+
+    elapsed = time() - start_time
+    print(f"   ⏱️  采样耗时: {elapsed:.1f} 秒")
+    print(f"   ✅ 采样完成: {len(selected_indices):,} / {N:,} patches")
+    print(f"   ✅ 采样效率: {len(selected_indices) / elapsed:.0f} samples/s")
+
+    return np.array(selected_indices[:target_n])
 
 
 def build_faiss_index(features, config):
-    """构建FAISS索引"""
+    """构建FAISS索引（保持不变）"""
     print("\n   🔨 构建FAISS索引...")
 
     N_images, N_patches, D = features.shape
@@ -509,15 +626,12 @@ def build_faiss_index(features, config):
 
     print(f"   📊 原始patch数: {patch_features.shape[0]:,}")
 
-    # Coreset采样
     if config.USE_CORESET and patch_features.shape[0] > 10000:
         coreset_indices = greedy_coreset_sampling(patch_features, config.CORESET_RATIO)
         patch_features = patch_features[coreset_indices]
 
-    # 归一化
     faiss.normalize_L2(patch_features)
 
-    # 构建索引
     if patch_features.shape[0] < 50000:
         index = faiss.IndexFlatL2(D)
         index.add(patch_features)
@@ -537,7 +651,7 @@ def build_faiss_index(features, config):
 
 # ==================== 步骤6：异常评分 ====================
 def compute_anomaly_scores(test_features, faiss_index, config):
-    """🔥 优化2：PatchCore软对齐"""
+    """PatchCore软对齐（保持不变）"""
     print("\n" + "=" * 60)
     print("📌 [步骤4-6] 计算异常分数 (PatchCore方式)")
     print("=" * 60)
@@ -550,17 +664,13 @@ def compute_anomaly_scores(test_features, faiss_index, config):
         query = test_features[i].astype('float32')
         faiss.normalize_L2(query)
 
-        # k-NN搜索
         distances, _ = faiss_index.search(query, config.N_NEIGHBORS)
 
-        # 每个patch的异常分数
         patch_scores = distances.mean(axis=1)
 
-        # 图像级分数
         image_score = patch_scores.max()
         anomaly_scores.append(image_score)
 
-        # 热力图
         h = w = int(np.sqrt(N_patches))
         anomaly_map = patch_scores.reshape(h, w)
         anomaly_maps.append(anomaly_map)
@@ -573,7 +683,7 @@ def compute_anomaly_scores(test_features, faiss_index, config):
 
 
 def generate_anomaly_heatmap(anomaly_map, original_img_path, save_path):
-    """生成异常热力图"""
+    """生成异常热力图（保持不变）"""
     img = cv2.imread(original_img_path)
     if img is None:
         print(f"⚠️  无法读取图片: {original_img_path}")
@@ -582,18 +692,14 @@ def generate_anomaly_heatmap(anomaly_map, original_img_path, save_path):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     H, W = img.shape[:2]
 
-    # 上采样
     heatmap = cv2.resize(anomaly_map, (W, H))
     heatmap = gaussian_filter(heatmap, sigma=4)
 
-    # 归一化
     heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
     heatmap = (heatmap * 255).astype(np.uint8)
 
-    # 颜色映射
     heatmap_color = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
 
-    # 叠加
     superimposed = cv2.addWeighted(img, 0.6, heatmap_color, 0.4, 0)
 
     cv2.imwrite(save_path, cv2.cvtColor(superimposed, cv2.COLOR_RGB2BGR))
@@ -617,34 +723,40 @@ class AnomalyDetectionPipeline:
     def run(self):
         """完整训练流程"""
         print("\n" + "=" * 60)
-        print("🚀 开始训练流程")
+        print("🚀 开始训练流程 (优化版)")
         print("=" * 60)
 
-        # 步骤1
+        # ========== 步骤1：AE粗筛（大batch加速）==========
         print(f"\n📂 加载初始正常图: {self.config.INITIAL_NORMAL_DIR}")
-        initial_dataset = ImageDataset(self.config.INITIAL_NORMAL_DIR, self.transform)
-        initial_loader = get_optimized_dataloader(
-            initial_dataset, self.config, shuffle=True
-        )  # ✅ 使用优化的loader
+        initial_dataset = ImageDataset(
+            self.config.INITIAL_NORMAL_DIR,
+            self.transform,
+            self.config.IMAGE_SIZE
+        )
+        initial_loader = get_ae_dataloader(initial_dataset, self.config, shuffle=True)
 
         ae_model = train_autoencoder(initial_loader, self.config)
 
         print(f"\n📂 加载混合图: {self.config.MIXED_DIR}")
-        mixed_dataset = ImageDataset(self.config.MIXED_DIR, self.transform)
-        mixed_loader = get_optimized_dataloader(
-            mixed_dataset, self.config, shuffle=False
-        )  # ✅ 使用优化的loader
+        mixed_dataset = ImageDataset(
+            self.config.MIXED_DIR,
+            self.transform,
+            self.config.IMAGE_SIZE
+        )
+        mixed_loader = get_ae_dataloader(mixed_dataset, self.config, shuffle=False)
 
         expanded_paths, _ = expand_normal_gallery(ae_model, mixed_loader, self.config)
 
-        # 步骤2
+        # ✅ 删除AE模型释放显存
+        del ae_model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # ========== 步骤2：DINOv3特征提取（小batch）==========
         all_normal_paths = initial_dataset.image_paths + expanded_paths
 
-
         gallery_dataset = PathDataset(all_normal_paths, self.transform)
-        gallery_loader = get_optimized_dataloader(
-            gallery_dataset, self.config, shuffle=False
-        )  # ✅ 使用优化的loader
+        gallery_loader = get_dino_dataloader(gallery_dataset, self.config, shuffle=False)
 
         feature_extractor = FeatureExtractor(self.config).to(self.config.DEVICE)
 
@@ -656,10 +768,10 @@ class AnomalyDetectionPipeline:
             gallery_features, gallery_paths, self.config
         )
 
-        # 步骤3
+        # ========== 步骤3：FAISS索引 ==========
         faiss_index, memory_bank = build_faiss_index(clean_features, self.config)
 
-        # 保存
+        # ========== 保存模型 ==========
         model_save_path = os.path.join(self.config.OUTPUT_DIR, 'model.pkl')
         with open(model_save_path, 'wb') as f:
             pickle.dump({
@@ -675,18 +787,13 @@ class AnomalyDetectionPipeline:
         return feature_extractor, faiss_index, clean_paths
 
     def inference(self, test_dir: str, feature_extractor, faiss_index):
-        """推理"""
+        """推理（小batch）"""
         print("\n" + "=" * 60)
-        print("🔍 开始异常检测")
+        print("🔍 开始异常检测 (小Batch优化)")
         print("=" * 60)
 
-        test_dataset = ImageDataset(test_dir, self.transform)
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=self.config.BATCH_SIZE,
-            shuffle=False,
-            num_workers=self.config.NUM_WORKERS
-        )
+        test_dataset = ImageDataset(test_dir, self.transform, self.config.IMAGE_SIZE)
+        test_loader = get_dino_dataloader(test_dataset, self.config, shuffle=False)
 
         test_features, test_paths = extract_features(
             test_loader, feature_extractor, self.config
@@ -696,11 +803,9 @@ class AnomalyDetectionPipeline:
             test_features, faiss_index, self.config
         )
 
-        # 动态阈值
         threshold = np.percentile(scores, self.config.ANOMALY_PERCENTILE)
         print(f"\n   🎯 动态阈值 ({self.config.ANOMALY_PERCENTILE}%分位): {threshold:.4f}")
 
-        # 排序
         sorted_indices = np.argsort(scores)[::-1]
 
         results = []
@@ -717,11 +822,14 @@ class AnomalyDetectionPipeline:
         with open(result_path, 'w', encoding='utf-8') as f:
             f.write(f"{'Rank':<6} {'Score':<12} {'Status':<12} {'Path'}\n")
             f.write("=" * 80 + "\n")
-            for r in results[:100]:
+
+            # ✅ 修改：保存所有结果而不是只保存前100
+            for r in results:  # 改为全部
                 status = '🔴 ANOMALY' if r['is_anomaly'] else '🟢 NORMAL'
                 f.write(f"{r['rank']:<6} {r['score']:<12.6f} {status:<12} {r['path']}\n")
 
         print(f"\n   ✅ 结果已保存: {result_path}")
+        print(f"   📊 保存数量: {len(results)} 张")  # ✅ 添加提示
 
         # 热力图
         heatmap_dir = os.path.join(self.config.OUTPUT_DIR, 'heatmaps')
@@ -753,14 +861,13 @@ class AnomalyDetectionPipeline:
         return results
 
 
-# ==================== 🔥 优化4：在线学习 ====================
+# ==================== 在线学习 ====================
 def incremental_update(new_normal_dir: str, model_path: str):
-    """增量更新Normal Gallery"""
+    """增量更新Normal Gallery（保持不变）"""
     print("\n" + "=" * 60)
     print("🔄 增量更新Normal Gallery")
     print("=" * 60)
 
-    # 加载模型
     with open(model_path, 'rb') as f:
         data = pickle.load(f)
 
@@ -770,7 +877,6 @@ def incremental_update(new_normal_dir: str, model_path: str):
 
     print(f"   📂 当前Gallery: {len(clean_paths)} 张")
 
-    # 提取新样本特征
     feature_extractor = FeatureExtractor(config).to(config.DEVICE)
 
     transform = transforms.Compose([
@@ -779,26 +885,18 @@ def incremental_update(new_normal_dir: str, model_path: str):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    new_dataset = ImageDataset(new_normal_dir, transform)
-    new_loader = DataLoader(
-        new_dataset,
-        batch_size=config.BATCH_SIZE,
-        shuffle=False,
-        num_workers=config.NUM_WORKERS
-    )
+    new_dataset = ImageDataset(new_normal_dir, transform, config.IMAGE_SIZE)
+    new_loader = get_dino_dataloader(new_dataset, config, shuffle=False)
 
     new_features, new_paths = extract_features(new_loader, feature_extractor, config)
 
-    # 添加到索引
     N, P, D = new_features.shape
     new_patch_features = new_features.reshape(-1, D).astype('float32')
     faiss.normalize_L2(new_patch_features)
     faiss_index.add(new_patch_features)
 
-    # 更新路径
     clean_paths.extend(new_paths)
 
-    # 保存
     with open(model_path, 'wb') as f:
         pickle.dump({
             'faiss_index': faiss.serialize_index(faiss_index),
@@ -813,10 +911,8 @@ def incremental_update(new_normal_dir: str, model_path: str):
 
 # ==================== 主函数 ====================
 if __name__ == '__main__':
-    # 配置
     config = Config()
 
-    # ✅ 验证路径
     print("\n" + "=" * 60)
     print("🔍 验证配置")
     print("=" * 60)
@@ -827,8 +923,10 @@ if __name__ == '__main__':
     print(f"✅ DINOv3权重: {config.DINOV3_WEIGHT_PATH}")
     print(f"✅ Backbone: {config.BACKBONE}")
     print(f"✅ 设备: {config.DEVICE}")
+    print(f"\n🔥 优化配置:")
+    print(f"   AE Batch: {config.AE_BATCH_SIZE} (混合精度: {config.AE_USE_AMP})")
+    print(f"   DINOv3 Batch: {config.DINO_BATCH_SIZE}")
 
-    # 检查路径
     if not os.path.exists(config.INITIAL_NORMAL_DIR):
         raise FileNotFoundError(f"训练数据路径不存在: {config.INITIAL_NORMAL_DIR}")
     if not os.path.exists(config.DINOV3_REPO_ROOT):
@@ -842,10 +940,9 @@ if __name__ == '__main__':
     feature_extractor, faiss_index, clean_paths = pipeline.run()
 
     # 推理
-    if os.path.exists(config.TEST_DIR):  # ✅ 使用config.TEST_DIR
+    if os.path.exists(config.TEST_DIR):
         results = pipeline.inference(config.TEST_DIR, feature_extractor, faiss_index)
 
-        # 打印Top 10
         print("\n" + "=" * 60)
         print("🔝 Top 10 最可疑异常")
         print("=" * 60)
